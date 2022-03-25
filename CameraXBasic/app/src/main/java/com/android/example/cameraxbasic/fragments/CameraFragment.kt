@@ -23,19 +23,29 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Point
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
+import android.hardware.camera2.CameraAccessException
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.util.Size
 import android.view.KeyEvent
 import android.view.LayoutInflater
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.MimeTypeMap
 import android.widget.Toast
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.*
 import androidx.camera.core.ImageCapture.Metadata
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -265,14 +275,7 @@ class CameraFragment : Fragment() {
     /** Declare and bind preview, capture and analysis use cases */
     private fun bindCameraUseCases() {
 
-        // Get screen metrics used to setup camera for full screen resolution
-        val metrics = windowManager.getCurrentWindowMetrics().bounds
-        Log.d(TAG, "Screen metrics: ${metrics.width()} x ${metrics.height()}")
-
-        val screenAspectRatio = aspectRatio(metrics.width(), metrics.height())
-        Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
-
-        val rotation = fragmentCameraBinding.viewFinder.display.rotation
+        val textureView = fragmentCameraBinding.viewFinder
 
         // CameraProvider
         val cameraProvider = cameraProvider
@@ -281,12 +284,13 @@ class CameraFragment : Fragment() {
         // CameraSelector
         val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
+        val cameraId = if (lensFacing == CameraSelector.LENS_FACING_BACK) { "0" } else { "1" }
+        val targetPreviewSize = getPreviewResolution(cameraId, RATIO_16_9_VALUE)
+        Log.d(TAG, "Target preview resolution ${targetPreviewSize.toPortrait()}")
+
         // Preview
         preview = Preview.Builder()
-                // We request aspect ratio but no resolution
-                .setTargetAspectRatio(screenAspectRatio)
-                // Set initial target rotation
-                .setTargetRotation(rotation)
+                .setTargetResolution(targetPreviewSize.toPortrait())
                 .build()
 
         // ImageCapture
@@ -294,29 +298,8 @@ class CameraFragment : Fragment() {
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 // We request aspect ratio but no resolution to match preview config, but letting
                 // CameraX optimize for whatever specific resolution best fits our use cases
-                .setTargetAspectRatio(screenAspectRatio)
-                // Set initial target rotation, we will have to call this again if rotation changes
-                // during the lifecycle of this use case
-                .setTargetRotation(rotation)
+                .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .build()
-
-        // ImageAnalysis
-        imageAnalyzer = ImageAnalysis.Builder()
-                // We request aspect ratio but no resolution
-                .setTargetAspectRatio(screenAspectRatio)
-                // Set initial target rotation, we will have to call this again if rotation changes
-                // during the lifecycle of this use case
-                .setTargetRotation(rotation)
-                .build()
-                // The analyzer can then be assigned to the instance
-                .also {
-                    it.setAnalyzer(cameraExecutor, LuminosityAnalyzer { luma ->
-                        // Values returned from our analyzer are passed to the attached listener
-                        // We log image analysis results here - you should do something useful
-                        // instead!
-                        Log.d(TAG, "Average luminosity: $luma")
-                    })
-                }
 
         // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
@@ -325,14 +308,80 @@ class CameraFragment : Fragment() {
             // A variable number of use-cases can be passed here -
             // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageCapture, imageAnalyzer)
+                    this, cameraSelector, preview, imageCapture)
 
             // Attach the viewfinder's surface provider to preview use case
-            preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
+            preview?.setSurfaceProvider { surfaceRequest ->
+                val surfaceTexture = textureView.surfaceTexture!!
+                val defaultBufferSize = surfaceRequest.resolution
+                Log.d(TAG, "Surface request resolution: ${surfaceRequest.resolution}")
+                Log.d(TAG, "Surface texture default buffer size: $defaultBufferSize")
+                surfaceTexture.setDefaultBufferSize(
+                    defaultBufferSize.width, defaultBufferSize.height)
+
+                val surface = Surface(surfaceTexture)
+                surfaceRequest.provideSurface(
+                    surface,
+                    cameraExecutor,
+                    { result ->
+                        Log.d(TAG, "Surface result $result")
+                        surface.release()
+                        surfaceTexture.release()
+                    }
+                )
+            }
             observeCameraState(camera?.cameraInfo!!)
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
         }
+    }
+
+    private fun Size.toPortrait(): Size {
+        return Size(min(this.width, this.height), max(this.width, this.height))
+    }
+
+    private fun Size.aspectRatio(): Double {
+        return this.width * 1.0 / this.height
+    }
+
+    private fun getPreviewResolution(cameraId: String, targetAspectRatio: Double) : Size {
+        val context = requireContext().applicationContext
+        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val map = characteristics.get(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+        )
+        val textureSizes = map!!.getOutputSizes(
+            SurfaceTexture::class.java
+        )
+
+        val displayMetrics = requireActivity().resources.displayMetrics
+        val displayWidth = max(displayMetrics.widthPixels, displayMetrics.heightPixels)
+        val displayHeight = min(displayMetrics.widthPixels, displayMetrics.heightPixels)
+        val maxPreviewWidth = min(MAX_PREVIEW_WIDTH, displayWidth)
+        val maxPreviewHeight = min(MAX_PREVIEW_HEIGHT, displayHeight)
+        Log.d(TAG, "Display size: $displayWidth x $displayHeight")
+
+        val aspectRatioFittingSizes =
+            textureSizes.filter { it.aspectRatio() == targetAspectRatio }
+        if (aspectRatioFittingSizes.isEmpty()) {
+            val fittingSize =
+                textureSizes.filter {
+                    it.width <= maxPreviewWidth && it.height <= maxPreviewHeight
+                }
+            if (fittingSize.isEmpty()) {
+                return textureSizes.minByOrNull { it.width * it.height }!!
+            }
+            return fittingSize.maxByOrNull { it.width * it.height }!!
+        }
+        val fittingSize =
+            aspectRatioFittingSizes.filter {
+                it.width <= maxPreviewWidth && it.height <= maxPreviewHeight
+            }
+        if (fittingSize.isEmpty()) {
+            return aspectRatioFittingSizes.minByOrNull { it.width * it.height }!!
+        }
+        return fittingSize.maxByOrNull { it.width * it.height }!!
     }
 
     private fun observeCameraState(cameraInfo: CameraInfo) {
@@ -685,6 +734,8 @@ class CameraFragment : Fragment() {
         private const val PHOTO_EXTENSION = ".jpg"
         private const val RATIO_4_3_VALUE = 4.0 / 3.0
         private const val RATIO_16_9_VALUE = 16.0 / 9.0
+        private const val MAX_PREVIEW_WIDTH = 1920
+        private const val MAX_PREVIEW_HEIGHT = 1080
 
         /** Helper function used to create a timestamped file */
         private fun createFile(baseFolder: File, format: String, extension: String) =
