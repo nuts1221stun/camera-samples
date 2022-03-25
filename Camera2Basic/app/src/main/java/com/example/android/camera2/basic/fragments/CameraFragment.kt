@@ -20,6 +20,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -35,9 +37,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Size
 import android.view.LayoutInflater
 import android.view.Surface
-import android.view.SurfaceHolder
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import androidx.core.graphics.drawable.toDrawable
@@ -49,7 +52,6 @@ import androidx.navigation.NavController
 import androidx.navigation.Navigation
 import androidx.navigation.fragment.navArgs
 import com.example.android.camera.utils.computeExifOrientation
-import com.example.android.camera.utils.getPreviewOutputSize
 import com.example.android.camera.utils.OrientationLiveData
 import com.example.android.camera2.basic.CameraActivity
 import com.example.android.camera2.basic.R
@@ -70,8 +72,10 @@ import kotlin.RuntimeException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
+import kotlin.math.max
+import kotlin.math.min
 
-class CameraFragment : Fragment() {
+class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
 
     /** Android ViewBinding */
     private var _fragmentCameraBinding: FragmentCameraBinding? = null
@@ -146,39 +150,12 @@ class CameraFragment : Fragment() {
     @SuppressLint("MissingPermission")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        fragmentCameraBinding.texture?.surfaceTextureListener = this
         fragmentCameraBinding.captureButton.setOnApplyWindowInsetsListener { v, insets ->
             v.translationX = (-insets.systemWindowInsetRight).toFloat()
             v.translationY = (-insets.systemWindowInsetBottom).toFloat()
             insets.consumeSystemWindowInsets()
         }
-
-        fragmentCameraBinding.viewFinder.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
-
-            override fun surfaceChanged(
-                    holder: SurfaceHolder,
-                    format: Int,
-                    width: Int,
-                    height: Int) = Unit
-
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                // Selects appropriate preview size and configures view finder
-                val previewSize = getPreviewOutputSize(
-                    fragmentCameraBinding.viewFinder.display,
-                    characteristics,
-                    SurfaceHolder::class.java
-                )
-                Log.d(TAG, "View finder size: ${fragmentCameraBinding.viewFinder.width} x ${fragmentCameraBinding.viewFinder.height}")
-                Log.d(TAG, "Selected preview size: $previewSize")
-                fragmentCameraBinding.viewFinder.setAspectRatio(
-                    previewSize.width,
-                    previewSize.height
-                )
-
-                // To ensure that size is set, initialize camera in the view's thread
-                view.post { initializeCamera() }
-            }
-        })
 
         // Used to rotate the output media to match device orientation
         relativeOrientation = OrientationLiveData(requireContext(), characteristics).apply {
@@ -187,6 +164,25 @@ class CameraFragment : Fragment() {
             })
         }
     }
+
+    override fun onSurfaceTextureAvailable(
+        surfaceTexture: SurfaceTexture,
+        width: Int, height: Int
+    ) {
+        Log.d(TAG, "Surface texture available $width, $height")
+        initializeCamera()
+    }
+
+    override fun onSurfaceTextureSizeChanged(
+        surfaceTexture: SurfaceTexture,
+        width: Int, height: Int
+    ) {}
+
+    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {}
 
     /**
      * Begin all camera operations in a coroutine in the main thread. This function:
@@ -206,14 +202,20 @@ class CameraFragment : Fragment() {
         imageReader = ImageReader.newInstance(
                 size.width, size.height, args.pixelFormat, IMAGE_BUFFER_SIZE)
 
+        val surfaceTexture = fragmentCameraBinding.texture?.surfaceTexture!!
+        val previewSize = getPreviewResolution(cameraManager, camera.id)
+        Log.d(TAG, "Preview size $previewSize")
+        surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
+        val surface = Surface(surfaceTexture)
+
         // Creates list of Surfaces where the camera will output frames
-        val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
+        val targets = listOf(surface, imageReader.surface)
 
         // Start a capture session using our open camera and list of Surfaces where frames will go
         session = createCaptureSession(camera, targets, cameraHandler)
 
         val captureRequest = camera.createCaptureRequest(
-                CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(fragmentCameraBinding.viewFinder.holder.surface) }
+                CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(surface) }
 
         // This will keep sending the capture request as frequently as possible until the
         // session is torn down or session.stopRepeating() is called
@@ -257,6 +259,50 @@ class CameraFragment : Fragment() {
                 it.post { it.isEnabled = true }
             }
         }
+    }
+
+    private fun Size.aspectRatio(): Float {
+        return this.width * 1.0f / this.height
+    }
+
+    @Throws(CameraAccessException::class)
+    private fun getPreviewResolution(manager: CameraManager, cameraId: String) : Size {
+        val characteristics = manager.getCameraCharacteristics(cameraId)
+        val map = characteristics.get(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+        )
+        val textureSizes = map!!.getOutputSizes(
+            SurfaceTexture::class.java
+        )
+
+        val displayMetrics = requireActivity().resources.displayMetrics
+        val displayWidth = max(displayMetrics.widthPixels, displayMetrics.heightPixels)
+        val displayHeight = min(displayMetrics.widthPixels, displayMetrics.heightPixels)
+        val maxPreviewWidth = min(1920, displayWidth)
+        val maxPreviewHeight = min(1080, displayHeight)
+        Log.d(TAG, "Display size: $displayWidth x $displayHeight")
+
+        val targetAspectRatio = 4.0f / 3.0f
+        val aspectRatioFittingSizes =
+            textureSizes.filter { it.aspectRatio() == targetAspectRatio }
+        if (aspectRatioFittingSizes.isEmpty()) {
+            val fittingSize =
+                textureSizes.filter {
+                    it.width <= maxPreviewWidth && it.height <= maxPreviewHeight
+                }
+            if (fittingSize.isEmpty()) {
+                return textureSizes.minByOrNull { it.width * it.height }!!
+            }
+            return fittingSize.maxByOrNull { it.width * it.height }!!
+        }
+        val fittingSize =
+            aspectRatioFittingSizes.filter {
+                it.width <= maxPreviewWidth && it.height <= maxPreviewHeight
+            }
+        if (fittingSize.isEmpty()) {
+            return aspectRatioFittingSizes.minByOrNull { it.width * it.height }!!
+        }
+        return fittingSize.maxByOrNull { it.width * it.height }!!
     }
 
     /** Opens the camera and returns the opened device (as the result of the suspend coroutine) */
@@ -345,7 +391,7 @@ class CameraFragment : Fragment() {
                     timestamp: Long,
                     frameNumber: Long) {
                 super.onCaptureStarted(session, request, timestamp, frameNumber)
-                fragmentCameraBinding.viewFinder.post(animationTask)
+
             }
 
             override fun onCaptureCompleted(
