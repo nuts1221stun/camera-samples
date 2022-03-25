@@ -81,6 +81,14 @@ import kotlin.collections.ArrayList
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import androidx.camera.core.UseCaseGroup
+
+import android.util.Rational
+
+import androidx.camera.core.ViewPort
+
+
+
 
 /** Helper type alias used for analysis use case callbacks */
 typealias LumaListener = (luma: Double) -> Unit
@@ -171,9 +179,9 @@ class CameraFragment : Fragment() {
     }
 
     override fun onCreateView(
-            inflater: LayoutInflater,
-            container: ViewGroup?,
-            savedInstanceState: Bundle?
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?,
     ): View {
         _fragmentCameraBinding = FragmentCameraBinding.inflate(inflater, container, false)
         return fragmentCameraBinding.root
@@ -284,8 +292,9 @@ class CameraFragment : Fragment() {
         // CameraSelector
         val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
+        val targetAspectRatio = Rational(16, 9)
         val cameraId = if (lensFacing == CameraSelector.LENS_FACING_BACK) { "0" } else { "1" }
-        val targetPreviewSize = getPreviewResolution(cameraId, RATIO_16_9_VALUE)
+        val targetPreviewSize = getPreviewResolution(cameraId, targetAspectRatio.toDouble())
         Log.d(TAG, "Target preview resolution ${targetPreviewSize.toPortrait()}")
 
         // Preview
@@ -304,16 +313,28 @@ class CameraFragment : Fragment() {
         // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
 
+        val viewPort = ViewPort.Builder(
+            Rational(targetAspectRatio.denominator, targetAspectRatio.numerator),
+            preview!!.targetRotation)
+            .build()
+        val useCaseGroup = UseCaseGroup.Builder()
+            .addUseCase(preview!!)
+            .addUseCase(imageCapture!!)
+            .setViewPort(viewPort)
+            .build()
+
         try {
             // A variable number of use-cases can be passed here -
             // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageCapture)
+                    this, cameraSelector, useCaseGroup)
 
             // Attach the viewfinder's surface provider to preview use case
             preview?.setSurfaceProvider { surfaceRequest ->
                 val surfaceTexture = textureView.surfaceTexture!!
-                val defaultBufferSize = surfaceRequest.resolution
+                val defaultBufferSize = Size(
+                    preview!!.resolutionInfo!!.cropRect.width(),
+                    preview!!.resolutionInfo!!.cropRect.height())
                 Log.d(TAG, "Surface request resolution: ${surfaceRequest.resolution}")
                 Log.d(TAG, "Surface texture default buffer size: $defaultBufferSize")
                 surfaceTexture.setDefaultBufferSize(
