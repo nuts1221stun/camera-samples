@@ -20,6 +20,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
@@ -74,6 +75,8 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.max
 import kotlin.math.min
+import android.graphics.RectF
+
 
 class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
 
@@ -139,9 +142,9 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
     private lateinit var relativeOrientation: OrientationLiveData
 
     override fun onCreateView(
-            inflater: LayoutInflater,
-            container: ViewGroup?,
-            savedInstanceState: Bundle?
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?,
     ): View {
         _fragmentCameraBinding = FragmentCameraBinding.inflate(inflater, container, false)
         return fragmentCameraBinding.root
@@ -167,7 +170,7 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
 
     override fun onSurfaceTextureAvailable(
         surfaceTexture: SurfaceTexture,
-        width: Int, height: Int
+        width: Int, height: Int,
     ) {
         Log.d(TAG, "Surface texture available $width, $height")
         initializeCamera()
@@ -175,14 +178,20 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
 
     override fun onSurfaceTextureSizeChanged(
         surfaceTexture: SurfaceTexture,
-        width: Int, height: Int
+        width: Int, height: Int,
     ) {}
 
     override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {}
+    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
+        val matrix = Matrix()
+        fragmentCameraBinding.texture!!.getTransform(matrix)
+        val textureMatrix = FloatArray(16)
+        surfaceTexture.getTransformMatrix(textureMatrix)
+        Log.d(TAG, "Transform matrix $matrix, ${textureMatrix.toList()}")
+    }
 
     /**
      * Begin all camera operations in a coroutine in the main thread. This function:
@@ -207,6 +216,7 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
         Log.d(TAG, "Preview size $previewSize")
         surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
         val surface = Surface(surfaceTexture)
+        configureTransform(previewSize.width, previewSize.height)
 
         // Creates list of Surfaces where the camera will output frames
         val targets = listOf(surface, imageReader.surface)
@@ -220,6 +230,12 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
         // This will keep sending the capture request as frequently as possible until the
         // session is torn down or session.stopRepeating() is called
         session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+
+        val matrix = Matrix()
+        fragmentCameraBinding.texture!!.getTransform(matrix)
+        val textureMatrix = FloatArray(16)
+        surfaceTexture.getTransformMatrix(textureMatrix)
+        Log.d(TAG, "=====Transform matrix $matrix, ${textureMatrix.toList()}")
 
         // Listen to the capture button
         fragmentCameraBinding.captureButton.setOnClickListener {
@@ -261,6 +277,29 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
         }
     }
 
+    private fun configureTransform(previewWidth: Int, previewHeight: Int) {
+        val textureView = fragmentCameraBinding.texture!!
+        val textureViewWidth = textureView.width
+        val textureViewHeight = textureView.height
+        val matrix = Matrix()
+        val textureViewRect = RectF(0f, 0f, textureViewWidth.toFloat(), textureViewHeight.toFloat())
+        val previewRect = RectF(0f, 0f, previewHeight.toFloat(), previewWidth.toFloat())
+        val textureViewCenterX = textureViewRect.centerX()
+        val textureViewCenterY = textureViewRect.centerY()
+        // if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
+            previewRect.offset(textureViewCenterX - previewRect.centerX(), textureViewCenterY - previewRect.centerY())
+            matrix.setRectToRect(textureViewRect, previewRect, Matrix.ScaleToFit.FILL)
+            val scale: Float = min(
+                textureViewHeight.toFloat() / previewHeight.toFloat(),
+                textureViewWidth.toFloat() / previewHeight.toFloat())
+            matrix.postScale(scale, scale, textureViewCenterX, textureViewCenterY)
+        //     matrix.postRotate((90 * (rotation - 2)).toFloat(), centerX, centerY)
+        // } else if (Surface.ROTATION_180 == rotation) {
+        //     matrix.postRotate(180f, centerX, centerY)
+        // }
+        fragmentCameraBinding.texture!!.setTransform(matrix)
+    }
+
     private fun Size.aspectRatio(): Float {
         return this.width * 1.0f / this.height
     }
@@ -281,6 +320,7 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
         val maxPreviewWidth = min(1920, displayWidth)
         val maxPreviewHeight = min(1080, displayHeight)
         Log.d(TAG, "Display size: $displayWidth x $displayHeight")
+        Log.d(TAG, "Available sizes: ${textureSizes.toList()}")
 
         val targetAspectRatio = 4.0f / 3.0f
         val aspectRatioFittingSizes =
@@ -308,9 +348,9 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
     /** Opens the camera and returns the opened device (as the result of the suspend coroutine) */
     @SuppressLint("MissingPermission")
     private suspend fun openCamera(
-            manager: CameraManager,
-            cameraId: String,
-            handler: Handler? = null
+        manager: CameraManager,
+        cameraId: String,
+        handler: Handler? = null,
     ): CameraDevice = suspendCancellableCoroutine { cont ->
         manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) = cont.resume(device)
@@ -341,9 +381,9 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
      * suspend coroutine
      */
     private suspend fun createCaptureSession(
-            device: CameraDevice,
-            targets: List<Surface>,
-            handler: Handler? = null
+        device: CameraDevice,
+        targets: List<Surface>,
+        handler: Handler? = null,
     ): CameraCaptureSession = suspendCoroutine { cont ->
 
         // Create a capture session using the predefined targets; this also involves defining the
@@ -386,18 +426,20 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
         session.capture(captureRequest.build(), object : CameraCaptureSession.CaptureCallback() {
 
             override fun onCaptureStarted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    timestamp: Long,
-                    frameNumber: Long) {
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                timestamp: Long,
+                frameNumber: Long,
+            ) {
                 super.onCaptureStarted(session, request, timestamp, frameNumber)
 
             }
 
             override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult) {
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
                 super.onCaptureCompleted(session, request, result)
                 val resultTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 Log.d(TAG, "Capture result received: $resultTimestamp")
@@ -520,10 +562,10 @@ class CameraFragment : Fragment(), TextureView.SurfaceTextureListener {
 
         /** Helper data class used to hold capture metadata with their associated image */
         data class CombinedCaptureResult(
-                val image: Image,
-                val metadata: CaptureResult,
-                val orientation: Int,
-                val format: Int
+            val image: Image,
+            val metadata: CaptureResult,
+            val orientation: Int,
+            val format: Int,
         ) : Closeable {
             override fun close() = image.close()
         }
